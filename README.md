@@ -1,8 +1,12 @@
 # ai-hik-tracking
 
 
-## Data Refereence
-https://github.com/okmd/playing-card-dataset.git
+## Training Data Refereence
+* https://github.com/okmd/playing-card-dataset.git
+
+
+## Use components
+* https://github.com/magicbear/py-hikevent
 
 
 ## Project Reference
