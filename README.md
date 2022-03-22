@@ -1,4 +1,5 @@
 # ai-hik-tracking
+Control DMX Laser using Deep Learning object detection
 
 
 ## Training Data Refereence

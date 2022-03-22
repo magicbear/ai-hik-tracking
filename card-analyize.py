@@ -15,7 +15,7 @@ import colorsys
 import base64
 import math
 from labelme import utils
-import getopt
+import sys, getopt
 from laser_control import ArtNetThread, GUIThread, TerminatedState
 
 terminated = TerminatedState()

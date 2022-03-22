@@ -30,7 +30,7 @@ import struct
 import sdl2
 import ctypes
 import socket
-import getopt
+import sys, getopt
 
 from laser_control import ArtNetThread, GUIThread, TerminatedState
 
