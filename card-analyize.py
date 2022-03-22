@@ -514,6 +514,10 @@ class AnalyizeThread(threading.Thread):
                 self.approx_thresh += 0.001
                 print("Approx Thresh %.4f" % self.approx_thresh)
                 return True
+            elif event.key.keysym.sym == sdl2.SDLK_F1:
+                global detailAnalyizeMode
+                detailAnalyizeMode = (detailAnalyizeMode+1)%3
+                print("Using Split Analyize Mode: %d" % detailAnalyizeMode)
         return False
 
     def nms_detections(self, lastIdentify, identifyConfidence, identifyObjects, card_location):
