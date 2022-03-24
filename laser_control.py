@@ -7,6 +7,89 @@ import struct
 import ctypes
 import datetime, time
 
+# Detectron2 Must be Import before darknet
+# from detectron2.utils.logger import setup_logger
+# setup_logger()
+#
+# from detectron2 import model_zoo
+# from detectron2.engine import DefaultPredictor
+# from detectron2.config import get_cfg
+# from detectron2.utils.visualizer import Visualizer
+# from detectron2.data import MetadataCatalog, DatasetCatalog
+# from detectron2.modeling import build_model
+# Detectron2 Must be Import before darknet
+
+import darknet
+import imutils, colorsys
+
+def getVarianceMean(scr, winSize):
+    if scr is None or winSize is None:
+        print("The input parameters of getVarianceMean Function error")
+        return -1
+
+    if winSize % 2 == 0:
+        print("The window size should be singular")
+        return -1
+
+    copyBorder_map = cv2.copyMakeBorder(scr, winSize // 2, winSize // 2, winSize // 2, winSize // 2,
+                                        cv2.BORDER_REPLICATE)
+    shape = np.shape(scr)
+
+    local_mean = np.zeros_like(scr)
+    local_std = np.zeros_like(scr)
+
+    for i in range(shape[0]):
+        for j in range(shape[1]):
+            temp = copyBorder_map[i:i + winSize, j:j + winSize]
+            local_mean[i, j], local_std[i, j] = cv2.meanStdDev(temp)
+            if local_std[i, j] <= 0:
+                local_std[i, j] = 1e-8
+
+    return local_mean, local_std
+
+
+def adaptContrastEnhancement(scr, winSize, maxCg):
+    if scr is None or winSize is None or maxCg is None:
+        print("The input parameters of ACE Function error")
+        return -1
+
+    YUV_img = cv2.cvtColor(scr, cv2.COLOR_BGR2YUV)  ##转换通道
+    Y_Channel = YUV_img[:, :, 0]
+    shape = np.shape(Y_Channel)
+
+    meansGlobal = cv2.mean(Y_Channel)[0]
+
+    ##这里提供使用boxfilter 计算局部均质和方差的方法
+    #    localMean_map=cv2.boxFilter(Y_Channel,-1,(winSize,winSize),normalize=True)
+    #    localVar_map=cv2.boxFilter(np.multiply(Y_Channel,Y_Channel),-1,(winSize,winSize),normalize=True)-np.multiply(localMean_map,localMean_map)
+    #    greater_Zero=localVar_map>0
+    #    localVar_map=localVar_map*greater_Zero+1e-8
+    #    localStd_map = np.sqrt(localVar_map)
+
+    localMean_map, localStd_map = getVarianceMean(Y_Channel, winSize)
+
+    for i in range(shape[0]):
+        for j in range(shape[1]):
+
+            cg = 0.2 * meansGlobal / localStd_map[i, j];
+            if cg > maxCg:
+                cg = maxCg
+            elif cg < 1:
+                cg = 1
+
+            temp = Y_Channel[i, j].astype(float)
+            temp = max(0, min(localMean_map[i, j] + cg * (temp - localMean_map[i, j]), 255))
+
+            #            Y_Channel[i,j]=max(0,min(localMean_map[i,j]+cg*(Y_Channel[i,j]-localMean_map[i,j]),255))
+            Y_Channel[i, j] = temp
+
+    YUV_img[:, :, 0] = Y_Channel
+
+    dst = cv2.cvtColor(YUV_img, cv2.COLOR_YUV2BGR)
+
+    return dst
+
+
 class TerminatedState:
     def __init__(self):
         self.terminated = False
@@ -23,7 +106,7 @@ class ArtNetThread(threading.Thread):
         self.mutex = threading.Lock()
         self.pos = None
         self.cal_mode = False
-        self.test_mode = False
+        self.test_mode = None
         self.duty_cycle = 0
         self.zoom_size = 245
         self.color = 15
@@ -117,8 +200,8 @@ class GUIThread(threading.Thread):
         self.terminated_state = ts
         self.artnet = artnet
         self.cal_mtx = []
-        self.window_width = 1920
-        self.window_height = 1080
+        self.window_width = 1280
+        self.window_height = 720
         cal_params = json.load(open("cam_cal.json", "r"))
         self.objpoints = cal_params['objpoints']
         self.imgpoints = cal_params['imgpoints']
@@ -223,7 +306,7 @@ class GUIThread(threading.Thread):
                         sdl2.SDL_WINDOWPOS_UNDEFINED,
                         window_width,
                         window_height,
-                        sdl2.SDL_WINDOW_SHOWN
+                        sdl2.SDL_WINDOW_SHOWN | sdl2.SDL_WINDOW_OPENGL
                     )
                     self.ren = sdl2.SDL_CreateRenderer(
                         self.win,
@@ -425,3 +508,467 @@ class GUIThread(threading.Thread):
                         break
                     elif event.type == sdl2.SDL_QUIT:
                         break
+
+
+class QueueFrame:
+    def __init__(self, frame, pick):
+        self.frame = frame
+        self.pick = pick
+
+
+class DarknetThread(threading.Thread):
+    def __init__(self, analyizeThread, terminated, cfg_file, data_file, weightFile):
+        threading.Thread.__init__(self)
+        self.analyizeThread = analyizeThread
+        self.terminated = terminated
+        self.darknet_width = None
+        self.darknet_height = None
+        self.mutex = threading.Lock()
+
+        self.network, self.class_names, self.class_colors = darknet.load_network(
+            cfg_file,
+            data_file,
+            weightFile,
+            batch_size=1
+        )
+
+        self.class_colors = {
+            self.class_names[i]: tuple((np.array(colorsys.hsv_to_rgb(i / len(self.class_names), 0.65, 0.6)) * 255).tolist()) for i
+            in range(len(self.class_names))
+        }
+        darknet_width = darknet.network_width(self.network)
+        darknet_height = darknet.network_height(self.network)
+        self.darknet_width = darknet_width
+        self.darknet_height = darknet_height
+        #
+        # self.tiny_network, self.tiny_class_names, self.tiny_class_colors = darknet.load_network(
+        #     'data/cfg/yolov4-tiny-cards.cfg',
+        #     'data/cards.data',
+        #     'backup/yolov4-tiny-cards_10000.weights',
+        #     batch_size=1
+        # )
+        # self.tiny_darknet_width = darknet.network_width(self.tiny_network)
+        # self.tiny_darknet_height = darknet.network_height(self.tiny_network)
+
+    def convert2relative(self, bbox):
+        """
+        YOLO format use relative coordinates for annotation
+        """
+        x, y, w, h = bbox
+        _height = self.darknet_height
+        _width = self.darknet_width
+        return x / _width, y / _height, w / _width, h / _height
+
+    def convert2original(self, image, bbox, base_offset=None):
+        x, y, w, h = self.convert2relative(bbox)
+
+        image_h, image_w, __ = image.shape
+
+        orig_x = int(x * image_w)
+        orig_y = int(y * image_h)
+        orig_width = int(w * image_w)
+        orig_height = int(h * image_h)
+
+        if base_offset is not None:
+            orig_x = int(base_offset[0] + x * base_offset[2])
+            orig_y = int(base_offset[1] + y * base_offset[3])
+            orig_width = int(w * base_offset[2])
+            orig_height = int(h * base_offset[3])
+
+        bbox_converted = [orig_x, orig_y, orig_width, orig_height]
+
+        return bbox_converted
+
+    def convert4cropping(self, image, bbox):
+        x, y, w, h = self.convert2relative(bbox)
+
+        image_h, image_w, __ = image.shape
+
+        orig_left = int((x - w / 2.) * image_w)
+        orig_right = int((x + w / 2.) * image_w)
+        orig_top = int((y - h / 2.) * image_h)
+        orig_bottom = int((y + h / 2.) * image_h)
+
+        if (orig_left < 0): orig_left = 0
+        if (orig_right > image_w - 1): orig_right = image_w - 1
+        if (orig_top < 0): orig_top = 0
+        if (orig_bottom > image_h - 1): orig_bottom = image_h - 1
+
+        bbox_cropping = (orig_left, orig_top, orig_right, orig_bottom)
+
+        return bbox_cropping
+
+    def run(self) -> None:
+        img_for_detect = darknet.make_image(self.darknet_width, self.darknet_height, 3)
+        # tiny_img_for_detect = darknet.make_image(self.tiny_darknet_width, self.tiny_darknet_height, 3)
+
+        while not self.terminated.get() and self.network is not None:
+            if self.analyizeThread.queue.qsize() > 0:
+                self.analyizeThread.mutex.acquire()
+                if self.analyizeThread.queue.qsize() > 0:
+                    queueFrame = self.analyizeThread.queue.get()
+                    self.analyizeThread.mutex.release()
+
+                    t1 = time.time()
+                    # img_arr = np.array(cv2.resize(queueFrame.frame,
+                    #                (self.tiny_darknet_width, self.tiny_darknet_height)))
+                    # darknet.copy_image_from_bytes(tiny_img_for_detect, img_arr.tobytes())
+                    # detections = darknet.detect_image(self.tiny_network, self.tiny_class_names, tiny_img_for_detect, thresh=0.75)
+                    #
+                    img_arr = np.array(
+                        cv2.resize(queueFrame.frame,
+                                   (self.darknet_width, self.darknet_height)))  # , interpolation=cv2.INTER_LANCZOS4))
+                    darknet.copy_image_from_bytes(img_for_detect, img_arr.tobytes())
+                    self.mutex.acquire()
+                    if self.network is None:
+                        break
+                    detections = darknet.detect_image(self.network, self.class_names, img_for_detect, thresh=0.75)
+                    self.mutex.release()
+
+                    self.analyizeThread.mutex.acquire()
+                    self.analyizeThread.t_detect += time.time() - t1
+                    self.analyizeThread.detection_done += 1
+                    (x, y, x2, y2) = queueFrame.pick if queueFrame.pick is not None else (
+                        0, 0, queueFrame.frame.shape[1], queueFrame.frame.shape[0])
+                    for label, confidence, bbox in detections:
+                        bbox_adjusted = self.convert2original(queueFrame.frame, bbox, (x, y, x2 - x, y2 - y))
+                        # bbox_adjusted = np.array(bbox_adjusted) + (x,y,w-x,h-y)
+                        self.analyizeThread.detections_adjusted.append([str(label), confidence, bbox_adjusted])
+                    self.analyizeThread.mutex.release()
+                else:
+                    self.analyizeThread.mutex.release()
+            else:
+                time.sleep(0.001)
+
+        darknet.free_image(img_for_detect)
+        # darknet.free_image(tiny_img_for_detect)
+
+    def stop(self):
+        self.mutex.acquire()
+        darknet.free_network_ptr(self.network)
+        self.network = None
+        self.mutex.release()
+
+
+class OpenCV_dnnThread(threading.Thread):
+    def __init__(self, analyizeThread, terminated, cfg_file, data_file, weightFile):
+        threading.Thread.__init__(self)
+        self.analyizeThread = analyizeThread
+        self.terminated = terminated
+        self.darknet_width = None
+        self.darknet_height = None
+        self.mutex = threading.Lock()
+
+        for line in open(cfg_file, 'r'):
+            cfg = line.split("=")
+            if cfg[0] == 'width':
+                self.darknet_width = int(cfg[1].strip())
+            elif cfg[0] == 'height':
+                self.darknet_height = int(cfg[1].strip())
+
+        metadata = darknet.load_meta(data_file.encode("ascii"))
+        self.class_names = [metadata.names[i].decode("ascii") for i in range(metadata.classes)]
+        self.class_colors = {
+            self.class_names[i]: tuple((np.array(colorsys.hsv_to_rgb(i/len(self.class_names), 0.65, 0.6))*255).tolist()) for i in range(len(self.class_names))
+        }
+
+        print("opencv dnn module loading...", end="")
+        self.net = cv2.dnn_DetectionModel(cfg_file, weightFile)
+        self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
+        self.net.setPreferableTarget(self.analyizeThread.default_pref)
+        # self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA_FP16)
+        self.net.setInputSize(self.darknet_width, self.darknet_height)
+        self.net.setInputScale(1.0 / 255)
+        self.net.setInputSwapRB(True)
+        print("done")
+
+    def convert2relative(self, bbox):
+        """
+        YOLO format use relative coordinates for annotation
+        """
+        x, y, w, h = bbox
+        _height = self.darknet_height
+        _width = self.darknet_width
+        return x / _width, y / _height, w / _width, h / _height
+
+    def convert2original(self, image, bbox, base_offset=None):
+        x, y, w, h = self.convert2relative(bbox)
+
+        image_h, image_w, __ = image.shape
+
+        orig_x = int(x * image_w)
+        orig_y = int(y * image_h)
+        orig_width = int(w * image_w)
+        orig_height = int(h * image_h)
+
+        if base_offset is not None:
+            orig_x = int(base_offset[0] + x * base_offset[2])
+            orig_y = int(base_offset[1] + y * base_offset[3])
+            orig_width = int(w * base_offset[2])
+            orig_height = int(h * base_offset[3])
+
+        bbox_converted = [orig_x, orig_y, orig_width, orig_height]
+
+        return bbox_converted
+
+    def convert4cropping(self, image, bbox):
+        x, y, w, h = self.convert2relative(bbox)
+
+        image_h, image_w, __ = image.shape
+
+        orig_left = int((x - w / 2.) * image_w)
+        orig_right = int((x + w / 2.) * image_w)
+        orig_top = int((y - h / 2.) * image_h)
+        orig_bottom = int((y + h / 2.) * image_h)
+
+        if (orig_left < 0): orig_left = 0
+        if (orig_right > image_w - 1): orig_right = image_w - 1
+        if (orig_top < 0): orig_top = 0
+        if (orig_bottom > image_h - 1): orig_bottom = image_h - 1
+
+        bbox_cropping = (orig_left, orig_top, orig_right, orig_bottom)
+
+        return bbox_cropping
+
+    def run(self) -> None:
+        while self.net is not None and not self.terminated.get():
+            if self.analyizeThread.queue.qsize() > 0:
+                self.analyizeThread.mutex.acquire()
+                if self.analyizeThread.queue.qsize() > 0:
+                    queueFrame = self.analyizeThread.queue.get()
+                    self.analyizeThread.mutex.release()
+
+                    t1 = time.time()
+
+                    img_arr = np.array(
+                        cv2.resize(queueFrame.frame,
+                                   (self.darknet_width, self.darknet_height)))  # , interpolation=cv2.INTER_LANCZOS4))
+
+                    self.mutex.acquire()
+                    if self.net is None:
+                        break
+                    classes, confidences, boxes = self.net.detect(img_arr, confThreshold=0.75, nmsThreshold=0.2)
+                    self.mutex.release()
+
+                    detections = zip(classes, confidences, boxes)
+
+                    self.analyizeThread.mutex.acquire()
+                    self.analyizeThread.t_detect += time.time() - t1
+                    self.analyizeThread.detection_done += 1
+                    (x, y, x2, y2) = queueFrame.pick if queueFrame.pick is not None else (
+                    0, 0, queueFrame.frame.shape[1], queueFrame.frame.shape[0])
+                    for label, confidence, bbox in detections:
+                        bbox_adjusted = self.convert2original(queueFrame.frame, bbox, (x, y, x2 - x, y2 - y))
+                        bbox_adjusted[0] += bbox_adjusted[2] / 2  # Convert To DarkNet Center Rect Format
+                        bbox_adjusted[1] += bbox_adjusted[3] / 2
+                        # bbox_adjusted = np.array(bbox_adjusted) + (x,y,w-x,h-y)
+                        self.analyizeThread.detections_adjusted.append(
+                            [self.class_names[label], confidence, bbox_adjusted])
+                    self.analyizeThread.mutex.release()
+                else:
+                    self.analyizeThread.mutex.release()
+            else:
+                time.sleep(0.001)
+
+    def stop(self):
+        self.mutex.acquire()
+        self.net = None
+        self.mutex.release()
+
+
+# from detectron2.config import get_cfg
+# from detectron2 import engine, model_zoo, config
+# from detectron2.utils.logger import setup_logger
+# from detectron2.utils.visualizer import Visualizer
+# from detectron2.data import MetadataCatalog, DatasetCatalog
+# from detectron2.modeling import build_model
+# from detectron2.engine import DefaultPredictor
+
+class Detectron2Thread(threading.Thread):
+    def __init__(self, analyizeThread, terminated, cfg_file, data_file, weightFile):
+        threading.Thread.__init__(self)
+
+        self.analyizeThread = analyizeThread
+        self.terminated = terminated
+        self.darknet_width = 640
+        self.darknet_height = 640
+        self.mutex = threading.Lock()
+
+        # cfg = config.get_cfg()
+        cfg = get_cfg()
+        # add project-specific config (e.g., TensorMask) here if you're not running a model in detectron2's core library
+        cfg.merge_from_file(cfg_file)
+        cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.5  # set threshold for this model
+        # Find a model from detectron2's model zoo. You can use the https://dl.fbaipublicfiles... url as well
+        cfg.MODEL.WEIGHTS = weightFile
+        self.predictor = DefaultPredictor(cfg)
+        self.class_names = MetadataCatalog.get(cfg.DATASETS.TRAIN[0]).thing_classes
+        self.class_colors = {
+            self.class_names[i]: tuple((np.array(colorsys.hsv_to_rgb(i / len(self.class_names), 0.65, 0.6)) * 255).tolist()) for i
+            in range(len(self.class_names))
+        }
+
+    def convert2relative(self, bbox):
+        """
+        YOLO format use relative coordinates for annotation
+        """
+        x, y, w, h = bbox
+        w -= x
+        h -= y
+        _height = self.darknet_height
+        _width = self.darknet_width
+        return x / _width, y / _height, w / _width, h / _height
+
+    def convert2original(self, image, bbox, base_offset=None):
+        x, y, w, h = self.convert2relative(bbox)
+
+        image_h, image_w, __ = image.shape
+
+        orig_x = int(x * image_w)
+        orig_y = int(y * image_h)
+        orig_width = int(w * image_w)
+        orig_height = int(h * image_h)
+
+        if base_offset is not None:
+            orig_x = int(base_offset[0] + x * base_offset[2])
+            orig_y = int(base_offset[1] + y * base_offset[3])
+            orig_width = int(w * base_offset[2])
+            orig_height = int(h * base_offset[3])
+
+        bbox_converted = [orig_x, orig_y, orig_width, orig_height]
+
+        return bbox_converted
+
+    def convert4cropping(self, image, bbox):
+        x, y, w, h = self.convert2relative(bbox)
+
+        image_h, image_w, __ = image.shape
+
+        orig_left = int((x - w / 2.) * image_w)
+        orig_right = int((x + w / 2.) * image_w)
+        orig_top = int((y - h / 2.) * image_h)
+        orig_bottom = int((y + h / 2.) * image_h)
+
+        if (orig_left < 0): orig_left = 0
+        if (orig_right > image_w - 1): orig_right = image_w - 1
+        if (orig_top < 0): orig_top = 0
+        if (orig_bottom > image_h - 1): orig_bottom = image_h - 1
+
+        bbox_cropping = (orig_left, orig_top, orig_right, orig_bottom)
+
+        return bbox_cropping
+
+    def run(self) -> None:
+        print("detectron2 loaded")
+
+
+        while self.predictor is not None and not self.terminated.get():
+            if self.analyizeThread.queue.qsize() > 0:
+                self.analyizeThread.mutex.acquire()
+                if self.analyizeThread.queue.qsize() > 0:
+                    queueFrame = self.analyizeThread.queue.get()
+                    self.darknet_width = queueFrame.frame.shape[1]
+                    self.darknet_height = queueFrame.frame.shape[0]
+                    self.analyizeThread.mutex.release()
+
+                    t1 = time.time()
+
+                    poslist = []
+                    self.mutex.acquire()
+                    if self.predictor is None:
+                        break
+                    outputs = self.predictor(queueFrame.frame)
+                    self.mutex.release()
+
+                    # We can use `Visualizer` to draw the predictions on the image.
+                    pred_classes = outputs['instances'].pred_classes.cpu().tolist()
+                    # pred_class_names = list(map(lambda x: self.class_names[x], pred_classes))
+                    confidences = outputs["instances"].scores.cpu().tolist()
+                    boxes = outputs["instances"].pred_boxes
+                    #
+                    # # cv2_imshow(out.get_image()[:, :, ::-1])
+                    # # Display the resulting frame
+                    # v = Visualizer(frame[:, :, ::-1], MetadataCatalog.get(cfg.DATASETS.TRAIN[0]), scale=1.2)
+                    # out = v.draw_instance_predictions(outputs["instances"][outputs["instances"].pred_classes == 0].to("cpu"))
+                    # # out = v.draw_instance_predictions(outputs["instances"].to("cpu"))
+                    # self.gui.mutex.acquire()
+                    # self.gui.frame = out.get_image()[:, :, ::-1]
+                    # self.gui.mutex.release()
+                    # for x in range(0,len(pred_classes)):
+                    #     if pred_class_names[x] == "person":
+                    #         # print("pred_classes", pred_classes, pred_class_names)
+                    #         size = (boxes[x].tensor[:, 2:] - boxes[x].tensor[:, :2]).cpu().tolist()
+                    #         pos = boxes[x].get_centers().cpu().tolist()
+                    #         X = self.gui.get_cal_point(pos[0][0] * 1280. / frame.shape[1], pos[0][1] * 720. / frame.shape[0], self.artnet.ptz_preset, True if len(outputs["instances"][outputs["instances"].pred_classes == 0]) == 1 else False)
+                    #         laser_x = X[0]
+                    #         laser_y = X[1]
+                    #
+                    #         print(pos, size)
+                    #         if laser_x < 0 or laser_y < 0 or laser_x > 255 or laser_y > 255:
+                    #             continue
+                    #         poslist.append(X);
+                    #
+
+
+                    detections = zip(pred_classes, confidences, boxes)
+
+                    self.analyizeThread.mutex.acquire()
+                    self.analyizeThread.t_detect += time.time() - t1
+                    self.analyizeThread.detection_done += 1
+                    (x, y, x2, y2) = queueFrame.pick if queueFrame.pick is not None else (0, 0, queueFrame.frame.shape[1], queueFrame.frame.shape[0])
+                    for label, confidence, bbox in detections:
+                        bbox_adjusted = self.convert2original(queueFrame.frame, bbox, (x, y, x2 - x, y2 - y))
+                        bbox_adjusted[0] += bbox_adjusted[2] / 2  # Convert To DarkNet Center Rect Format
+                        bbox_adjusted[1] += bbox_adjusted[3] / 2
+                        # bbox_adjusted = np.array(bbox_adjusted) + (x,y,w-x,h-y)
+                        self.analyizeThread.detections_adjusted.append(
+                            [self.class_names[label], confidence, bbox_adjusted])
+                    self.analyizeThread.mutex.release()
+                else:
+                    self.analyizeThread.mutex.release()
+            else:
+                time.sleep(0.001)
+
+    def stop(self):
+        self.mutex.acquire()
+        self.predictor = None
+        self.mutex.release()
+
+
+def nms_detections(lastIdentify, identifyConfidence, identifyObjects):
+    if len(identifyObjects) >= 3:
+        confidence_sorted = []
+        for confidence_id in range(len(identifyConfidence)):
+            confidence_sorted.append([identifyConfidence[confidence_id], identifyObjects[confidence_id]])
+        confidence_sorted.sort(key=lambda x: x[0], reverse=True)
+
+        sorted_result = np.array(confidence_sorted[:2], dtype=object)
+        identifyConfidence = sorted_result[:, 0].tolist()
+        identifyObjects = sorted_result[:, 1].tolist()
+        # print("Ignore ",lastIdentify, identifyObjects, identifyObjects, identifyConfidence)
+
+    # Darknet Detect Result
+    # Center X, Center Y, Width, Height
+    identifyObjects = np.asarray(identifyObjects, dtype=float)
+    identifyObjects[:, 0:2] -= identifyObjects[:, 2:4] / 2
+    identifyObjects[:, 2:4] += identifyObjects[:, 0:2]
+
+    # Convert To x1, y1, x2, y2 Rect for NMS
+    pick = imutils.object_detection.non_max_suppression(identifyObjects, probs=None,
+                                                        overlapThresh=0.1)
+
+    cw = (np.max(identifyObjects[:, 2]) - np.min(identifyObjects[:, 0]))
+    ch = (np.max(identifyObjects[:, 3]) - np.min(identifyObjects[:, 1]))
+    mid_points_x = np.min(identifyObjects[:, 0]) + cw / 2
+    mid_points_y = np.min(identifyObjects[:, 1]) + ch / 2
+
+    rc = []
+    for rect in pick:
+        (x, y, w, h) = rect
+        w = w - x
+        h = h - y
+        x = x + w / 2
+        y = y + h / 2
+        # Recovery to darknet format
+        rc.append((lastIdentify, "%.02f" % np.average(identifyConfidence), (x, y, w, h)))
+    return rc

@@ -16,7 +16,7 @@ import base64
 import math
 from labelme import utils
 import sys, getopt
-from laser_control import ArtNetThread, GUIThread, TerminatedState
+from laser_control import ArtNetThread, GUIThread, TerminatedState, OpenCV_dnnThread, DarknetThread, QueueFrame, nms_detections
 
 terminated = TerminatedState()
 
@@ -36,337 +36,6 @@ weightFile = None
 
 def mapfloat(x, in_min, in_max, out_min, out_max):
     return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
-
-
-def getVarianceMean(scr, winSize):
-    if scr is None or winSize is None:
-        print("The input parameters of getVarianceMean Function error")
-        return -1
-
-    if winSize % 2 == 0:
-        print("The window size should be singular")
-        return -1
-
-    copyBorder_map = cv2.copyMakeBorder(scr, winSize // 2, winSize // 2, winSize // 2, winSize // 2,
-                                        cv2.BORDER_REPLICATE)
-    shape = np.shape(scr)
-
-    local_mean = np.zeros_like(scr)
-    local_std = np.zeros_like(scr)
-
-    for i in range(shape[0]):
-        for j in range(shape[1]):
-            temp = copyBorder_map[i:i + winSize, j:j + winSize]
-            local_mean[i, j], local_std[i, j] = cv2.meanStdDev(temp)
-            if local_std[i, j] <= 0:
-                local_std[i, j] = 1e-8
-
-    return local_mean, local_std
-
-
-def adaptContrastEnhancement(scr, winSize, maxCg):
-    if scr is None or winSize is None or maxCg is None:
-        print("The input parameters of ACE Function error")
-        return -1
-
-    YUV_img = cv2.cvtColor(scr, cv2.COLOR_BGR2YUV)  ##转换通道
-    Y_Channel = YUV_img[:, :, 0]
-    shape = np.shape(Y_Channel)
-
-    meansGlobal = cv2.mean(Y_Channel)[0]
-
-    ##这里提供使用boxfilter 计算局部均质和方差的方法
-    #    localMean_map=cv2.boxFilter(Y_Channel,-1,(winSize,winSize),normalize=True)
-    #    localVar_map=cv2.boxFilter(np.multiply(Y_Channel,Y_Channel),-1,(winSize,winSize),normalize=True)-np.multiply(localMean_map,localMean_map)
-    #    greater_Zero=localVar_map>0
-    #    localVar_map=localVar_map*greater_Zero+1e-8
-    #    localStd_map = np.sqrt(localVar_map)
-
-    localMean_map, localStd_map = getVarianceMean(Y_Channel, winSize)
-
-    for i in range(shape[0]):
-        for j in range(shape[1]):
-
-            cg = 0.2 * meansGlobal / localStd_map[i, j];
-            if cg > maxCg:
-                cg = maxCg
-            elif cg < 1:
-                cg = 1
-
-            temp = Y_Channel[i, j].astype(float)
-            temp = max(0, min(localMean_map[i, j] + cg * (temp - localMean_map[i, j]), 255))
-
-            #            Y_Channel[i,j]=max(0,min(localMean_map[i,j]+cg*(Y_Channel[i,j]-localMean_map[i,j]),255))
-            Y_Channel[i, j] = temp
-
-    YUV_img[:, :, 0] = Y_Channel
-
-    dst = cv2.cvtColor(YUV_img, cv2.COLOR_YUV2BGR)
-
-    return dst
-
-
-class QueueFrame:
-    def __init__(self, frame, pick):
-        self.frame = frame
-        self.pick = pick
-
-
-class DarknetThread(threading.Thread):
-    def __init__(self, analyizeThread, terminated):
-        threading.Thread.__init__(self)
-        self.analyizeThread = analyizeThread
-        self.terminated = terminated
-        self.darknet_width = None
-        self.darknet_height = None
-        self.mutex = threading.Lock()
-
-        self.network, self.class_names, self.class_colors = darknet.load_network(
-            cfg_file,
-            data_file,
-            weightFile,
-            batch_size=1
-        )
-
-        darknet_width = darknet.network_width(self.network)
-        darknet_height = darknet.network_height(self.network)
-        self.darknet_width = darknet_width
-        self.darknet_height = darknet_height
-        #
-        # self.tiny_network, self.tiny_class_names, self.tiny_class_colors = darknet.load_network(
-        #     'data/cfg/yolov4-tiny-cards.cfg',
-        #     'data/cards.data',
-        #     'backup/yolov4-tiny-cards_10000.weights',
-        #     batch_size=1
-        # )
-        # self.tiny_darknet_width = darknet.network_width(self.tiny_network)
-        # self.tiny_darknet_height = darknet.network_height(self.tiny_network)
-
-    def convert2relative(self, bbox):
-        """
-        YOLO format use relative coordinates for annotation
-        """
-        x, y, w, h = bbox
-        _height = self.darknet_height
-        _width = self.darknet_width
-        return x / _width, y / _height, w / _width, h / _height
-
-    def convert2original(self, image, bbox, base_offset=None):
-        x, y, w, h = self.convert2relative(bbox)
-
-        image_h, image_w, __ = image.shape
-
-        orig_x = int(x * image_w)
-        orig_y = int(y * image_h)
-        orig_width = int(w * image_w)
-        orig_height = int(h * image_h)
-
-        if base_offset is not None:
-            orig_x = int(base_offset[0] + x * base_offset[2])
-            orig_y = int(base_offset[1] + y * base_offset[3])
-            orig_width = int(w * base_offset[2])
-            orig_height = int(h * base_offset[3])
-
-        bbox_converted = [orig_x, orig_y, orig_width, orig_height]
-
-        return bbox_converted
-
-    def convert4cropping(self, image, bbox):
-        x, y, w, h = self.convert2relative(bbox)
-
-        image_h, image_w, __ = image.shape
-
-        orig_left = int((x - w / 2.) * image_w)
-        orig_right = int((x + w / 2.) * image_w)
-        orig_top = int((y - h / 2.) * image_h)
-        orig_bottom = int((y + h / 2.) * image_h)
-
-        if (orig_left < 0): orig_left = 0
-        if (orig_right > image_w - 1): orig_right = image_w - 1
-        if (orig_top < 0): orig_top = 0
-        if (orig_bottom > image_h - 1): orig_bottom = image_h - 1
-
-        bbox_cropping = (orig_left, orig_top, orig_right, orig_bottom)
-
-        return bbox_cropping
-
-    def run(self) -> None:
-        img_for_detect = darknet.make_image(self.darknet_width, self.darknet_height, 3)
-        # tiny_img_for_detect = darknet.make_image(self.tiny_darknet_width, self.tiny_darknet_height, 3)
-
-        while not self.terminated.get() and self.network is not None:
-            if self.analyizeThread.queue.qsize() > 0:
-                self.analyizeThread.mutex.acquire()
-                if self.analyizeThread.queue.qsize() > 0:
-                    queueFrame = self.analyizeThread.queue.get()
-                    self.analyizeThread.mutex.release()
-
-                    t1 = time.time()
-                    # img_arr = np.array(cv2.resize(queueFrame.frame,
-                    #                (self.tiny_darknet_width, self.tiny_darknet_height)))
-                    # darknet.copy_image_from_bytes(tiny_img_for_detect, img_arr.tobytes())
-                    # detections = darknet.detect_image(self.tiny_network, self.tiny_class_names, tiny_img_for_detect, thresh=0.75)
-                    #
-                    img_arr = np.array(
-                        cv2.resize(queueFrame.frame,
-                                   (self.darknet_width, self.darknet_height)))  # , interpolation=cv2.INTER_LANCZOS4))
-                    darknet.copy_image_from_bytes(img_for_detect, img_arr.tobytes())
-                    self.mutex.acquire()
-                    if self.network is None:
-                        break
-                    detections = darknet.detect_image(self.network, self.class_names, img_for_detect, thresh=0.75)
-                    self.mutex.release()
-
-                    self.analyizeThread.mutex.acquire()
-                    self.analyizeThread.t_detect += time.time() - t1
-                    self.analyizeThread.detection_done += 1
-                    (x, y, x2, y2) = queueFrame.pick if queueFrame.pick is not None else (
-                        0, 0, queueFrame.frame.shape[1], queueFrame.frame.shape[0])
-                    for label, confidence, bbox in detections:
-                        bbox_adjusted = self.convert2original(frame, bbox, (x, y, x2 - x, y2 - y))
-                        # bbox_adjusted = np.array(bbox_adjusted) + (x,y,w-x,h-y)
-                        self.analyizeThread.detections_adjusted.append([str(label), confidence, bbox_adjusted])
-                    self.analyizeThread.mutex.release()
-                else:
-                    self.analyizeThread.mutex.release()
-            else:
-                time.sleep(0.001)
-
-        darknet.free_image(img_for_detect)
-        # darknet.free_image(tiny_img_for_detect)
-
-    def stop(self):
-        self.mutex.acquire()
-        darknet.free_network_ptr(self.network)
-        self.network = None
-        self.mutex.release()
-
-
-class OpenCV_dnnThread(threading.Thread):
-    def __init__(self, analyizeThread, terminated):
-        threading.Thread.__init__(self)
-        self.analyizeThread = analyizeThread
-        self.terminated = terminated
-        self.darknet_width = None
-        self.darknet_height = None
-        self.mutex = threading.Lock()
-
-        for line in open(cfg_file, 'r'):
-            cfg = line.split("=")
-            if cfg[0] == 'width':
-                self.darknet_width = int(cfg[1].strip())
-            elif cfg[0] == 'height':
-                self.darknet_height = int(cfg[1].strip())
-
-        metadata = darknet.load_meta(data_file.encode("ascii"))
-        self.class_names = [metadata.names[i].decode("ascii") for i in range(metadata.classes)]
-        self.class_colors = darknet.class_colors(self.class_names)
-
-        print("opencv dnn module loading...", end="")
-        self.net = cv2.dnn_DetectionModel(cfg_file, weightFile)
-        self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
-        self.net.setPreferableTarget(self.analyizeThread.default_pref)
-        # self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA_FP16)
-        self.net.setInputSize(self.darknet_width, self.darknet_height)
-        self.net.setInputScale(1.0 / 255)
-        self.net.setInputSwapRB(True)
-        print("done")
-
-    def convert2relative(self, bbox):
-        """
-        YOLO format use relative coordinates for annotation
-        """
-        x, y, w, h = bbox
-        _height = self.darknet_height
-        _width = self.darknet_width
-        return x / _width, y / _height, w / _width, h / _height
-
-    def convert2original(self, image, bbox, base_offset=None):
-        x, y, w, h = self.convert2relative(bbox)
-
-        image_h, image_w, __ = image.shape
-
-        orig_x = int(x * image_w)
-        orig_y = int(y * image_h)
-        orig_width = int(w * image_w)
-        orig_height = int(h * image_h)
-
-        if base_offset is not None:
-            orig_x = int(base_offset[0] + x * base_offset[2])
-            orig_y = int(base_offset[1] + y * base_offset[3])
-            orig_width = int(w * base_offset[2])
-            orig_height = int(h * base_offset[3])
-
-        bbox_converted = [orig_x, orig_y, orig_width, orig_height]
-
-        return bbox_converted
-
-    def convert4cropping(self, image, bbox):
-        x, y, w, h = self.convert2relative(bbox)
-
-        image_h, image_w, __ = image.shape
-
-        orig_left = int((x - w / 2.) * image_w)
-        orig_right = int((x + w / 2.) * image_w)
-        orig_top = int((y - h / 2.) * image_h)
-        orig_bottom = int((y + h / 2.) * image_h)
-
-        if (orig_left < 0): orig_left = 0
-        if (orig_right > image_w - 1): orig_right = image_w - 1
-        if (orig_top < 0): orig_top = 0
-        if (orig_bottom > image_h - 1): orig_bottom = image_h - 1
-
-        bbox_cropping = (orig_left, orig_top, orig_right, orig_bottom)
-
-        return bbox_cropping
-
-    def run(self) -> None:
-        img_for_detect = darknet.make_image(self.darknet_width, self.darknet_height, 3)
-        # tiny_img_for_detect = darknet.make_image(self.tiny_darknet_width, self.tiny_darknet_height, 3)
-
-        while self.net is not None and not self.terminated.get():
-            if self.analyizeThread.queue.qsize() > 0:
-                self.analyizeThread.mutex.acquire()
-                if self.analyizeThread.queue.qsize() > 0:
-                    queueFrame = self.analyizeThread.queue.get()
-                    self.analyizeThread.mutex.release()
-
-                    t1 = time.time()
-
-                    img_arr = np.array(
-                        cv2.resize(queueFrame.frame,
-                                   (self.darknet_width, self.darknet_height)))  # , interpolation=cv2.INTER_LANCZOS4))
-
-                    self.mutex.acquire()
-                    if self.net is None:
-                        break
-                    classes, confidences, boxes = self.net.detect(img_arr, confThreshold=0.1, nmsThreshold=0.8)
-                    self.mutex.release()
-
-                    detections = zip(classes, confidences, boxes)
-
-                    self.analyizeThread.mutex.acquire()
-                    self.analyizeThread.t_detect += time.time() - t1
-                    self.analyizeThread.detection_done += 1
-                    (x, y, x2, y2) = queueFrame.pick if queueFrame.pick is not None else (
-                    0, 0, queueFrame.frame.shape[1], queueFrame.frame.shape[0])
-                    for label, confidence, bbox in detections:
-                        bbox_adjusted = self.convert2original(frame, bbox, (x, y, x2 - x, y2 - y))
-                        bbox_adjusted[0] += bbox_adjusted[2] / 2  # Convert To DarkNet Center Rect Format
-                        bbox_adjusted[1] += bbox_adjusted[3] / 2
-                        # bbox_adjusted = np.array(bbox_adjusted) + (x,y,w-x,h-y)
-                        self.analyizeThread.detections_adjusted.append(
-                            [self.class_names[label], confidence, bbox_adjusted])
-                    self.analyizeThread.mutex.release()
-                else:
-                    self.analyizeThread.mutex.release()
-            else:
-                time.sleep(0.001)
-
-    def stop(self):
-        self.mutex.acquire()
-        self.net = None
-        self.mutex.release()
 
 
 class AnalyizeThread(threading.Thread):
@@ -397,6 +66,11 @@ class AnalyizeThread(threading.Thread):
         self.backend = "darknet"
         self.default_pref = cv2.dnn.DNN_TARGET_CUDA_FP16
         self.load_dnn_networks()
+        self.sat_thresh = 60
+        self.bright_thresh = 60
+        self.max_frame_width = 1280
+        self.max_frame_height = 720
+        self.adjustAttributes = {}
 
     def load_dnn_networks(self, load_cfg=0):
         global cfg_file, weightFile
@@ -404,12 +78,13 @@ class AnalyizeThread(threading.Thread):
             ['data/cfg/yolov4-cards.cfg', 'backup/ai-fake-real-yolov4-cards_30000.weights'],
             ['data/cfg/yolov4-tiny-cards.cfg', 'backup/ai-mixed-yolov4-tiny-cards_final.weights'],
             ['data/cfg/yolov4-tiny-3l-cards.cfg', 'backup/ai-mixed-yolov4-tiny-3l-cards_final.weights'],
-            ['data/cfg/yolov4-tiny-3l-cards.cfg', 'backup/ai-mixed-yolov4-tiny-3l-cards_best.weights'],
-            ['data/cfg/yolov4-tiny-3l-cards.cfg', 'backup/yolov4-tiny-3l-cards_best.weights'],
-            ['data/cfg/yolov4-tiny-3l-cards.cfg', 'backup/yolov4-tiny-3l-cards_last.weights'],
-            ['data/cfg/yolov4-tiny-3l-cards.cfg', 'backup/yolov4-tiny-3l-cards_90000.weights'],
+            ['data/cfg/yolov4-cards.cfg', 'backup/yolov4-cards_last.weights'],
+            ['data/cfg/yolov4-cards.cfg', 'backup/yolov4-cards_best.weights'],
+            ['data/cfg/yolov4-cards.cfg', 'backup/yolov4-cards_10000.weights'],
+            ['data/cfg/yolov4-cards.cfg', 'backup/yolov4-cards_20000.weights'],
+            ['data/cfg/yolov4-cards.cfg', 'backup/yolov4-cards_30000.weights'],
         ]
-        if load_cfg > len(config_set):
+        if load_cfg >= len(config_set):
             load_cfg = load_cfg % len(config_set)
         cfg_file = config_set[load_cfg][0]
         weightFile = config_set[load_cfg][1]
@@ -426,12 +101,12 @@ class AnalyizeThread(threading.Thread):
 
         if self.backend == "darknet":
             for i in range(1):
-                th_darknet = DarknetThread(self, terminated)
+                th_darknet = DarknetThread(self, terminated, cfg_file, data_file, weightFile)
                 th_darknet.start()
                 self.threads.append(th_darknet)
         else:
             for i in range(4):
-                th_darknet = OpenCV_dnnThread(self, terminated)
+                th_darknet = OpenCV_dnnThread(self, terminated, cfg_file, data_file, weightFile)
                 th_darknet.start()
                 self.threads.append(th_darknet)
 
@@ -483,6 +158,16 @@ class AnalyizeThread(threading.Thread):
                 labelme_format["shapes"] = shapes
                 json.dump(labelme_format, open("data/saved/%d.json" % now_ts, "w"), ensure_ascii=False, indent=2)
                 return True
+            elif event.key.keysym.sym == sdl2.SDLK_w or event.key.keysym.sym == sdl2.SDLK_s:
+                self.mutex.acquire()
+                del self.adjustAttributes['sat_thresh']
+                self.mutex.release()
+                return True
+            elif event.key.keysym.sym == sdl2.SDLK_a or event.key.keysym.sym == sdl2.SDLK_d:
+                self.mutex.acquire()
+                del self.adjustAttributes['bright_thresh']
+                self.mutex.release()
+                return True
             elif event.key.keysym.sym == sdl2.SDLK_c and (event.key.keysym.mod & sdl2.KMOD_CTRL):
                 self.useCudaProcess = not self.useCudaProcess
                 print("Using Cuda: %s" % ("YES" if self.useCudaProcess else "No"))
@@ -518,6 +203,19 @@ class AnalyizeThread(threading.Thread):
                 global detailAnalyizeMode
                 detailAnalyizeMode = (detailAnalyizeMode+1)%3
                 print("Using Split Analyize Mode: %d" % detailAnalyizeMode)
+        elif event.type == sdl2.SDL_KEYDOWN:
+            if event.key.keysym.sym == sdl2.SDLK_w:
+                self.adjustAttributes['sat_thresh'] = True
+                return True
+            elif event.key.keysym.sym == sdl2.SDLK_s:
+                self.adjustAttributes['sat_thresh'] = False
+                return True
+            elif event.key.keysym.sym == sdl2.SDLK_a:
+                self.adjustAttributes['bright_thresh'] = False
+                return True
+            elif event.key.keysym.sym == sdl2.SDLK_d:
+                self.adjustAttributes['bright_thresh'] = True
+                return True
         return False
 
     def nms_detections(self, lastIdentify, identifyConfidence, identifyObjects, card_location):
@@ -667,6 +365,14 @@ class AnalyizeThread(threading.Thread):
                 #
                 frame = self.frame
                 self.frame = None
+                for adjustKey in self.adjustAttributes:
+                    self.__dict__[adjustKey] += 1 if self.adjustAttributes[adjustKey] else -1
+                    if self.__dict__[adjustKey] > 255:
+                        self.__dict__[adjustKey] = 255
+                    elif self.__dict__[adjustKey] < 0:
+                        self.__dict__[adjustKey] = 0
+                    print("Set %s -> %d" % (adjustKey, self.__dict__[adjustKey]))
+
                 self.mutex.release()
 
                 if not self.artnet.cal_mode and self.artnet.test_mode is None:
@@ -696,28 +402,32 @@ class AnalyizeThread(threading.Thread):
 
                         gpu_contract_frame.upload(frame)
 
-                        cv2.cuda.addWeighted(gpu_contract_frame, self.alpha, gpu_zero, 0, self.beta, gpu_frame)
+                        if self.alpha != 1 or self.beta != 0:
+                            cv2.cuda.addWeighted(gpu_contract_frame, self.alpha, gpu_zero, 0, self.beta, gpu_frame)
+                            cv2.cuda.cvtColor(gpu_frame, cv2.COLOR_RGB2HSV, gpu_hsv)
+                            frame = gpu_frame.download()
+                        else:
+                            cv2.cuda.cvtColor(gpu_contract_frame, cv2.COLOR_RGB2HSV, gpu_hsv)
+                            frame = gpu_contract_frame.download()
 
-                        cv2.cuda.cvtColor(gpu_frame, cv2.COLOR_RGB2HSV, gpu_hsv)
                         cv2.cuda.split(gpu_hsv, d_hsv)
 
-                        cv2.cuda.threshold(d_hsv[1], 50, 1, cv2.THRESH_BINARY_INV,
+                        cv2.cuda.threshold(d_hsv[1], self.sat_thresh, 1, cv2.THRESH_BINARY_INV,
                                            hsv_bin)  # white = np.where(hsv[:, :, 1] < 50, hsv[:, :, 2], 0)
                         cv2.cuda.multiply(d_hsv[2], hsv_bin, gpu_white)
-                        cv2.cuda.threshold(d_hsv[0], 40, 1, cv2.THRESH_BINARY_INV,
+                        cv2.cuda.threshold(d_hsv[0], self.bright_thresh, 1, cv2.THRESH_BINARY_INV,
                                            hsv_bin)  # white = np.where(hsv[:, :, 0] < 40, white, 0)
                         cv2.cuda.multiply(gpu_white, hsv_bin, gpu_white)
 
                         gpu_gaussian.apply(gpu_white, gpu_blur)
                         retval, thresh_image = cv2.threshold(gpu_blur.download().astype(np.uint8), 0, 255,
                                                              cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                        frame = gpu_frame.download()
                     else:
                         frame = cv2.convertScaleAbs(frame, alpha=self.alpha, beta=self.beta)
                         hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
-                        retval, sat_bin = cv2.threshold(hsv[:, :, 1], 50, 1,
+                        retval, sat_bin = cv2.threshold(hsv[:, :, 1], self.sat_thresh, 1,
                                                         cv2.THRESH_BINARY_INV)  # white = np.where(hsv[:, :, 1] < 50, hsv[:, :, 2], 0)
-                        retval, hue_bin = cv2.threshold(hsv[:, :, 0], 40, 1,
+                        retval, hue_bin = cv2.threshold(hsv[:, :, 0], self.bright_thresh, 1,
                                                         cv2.THRESH_BINARY_INV)  # white = np.where(hsv[:, :, 0] < 40, white, 0)
                         white = hsv[:, :, 2] * sat_bin * hue_bin
                         blur = cv2.GaussianBlur(white, (5, 5), 0)
@@ -748,8 +458,8 @@ class AnalyizeThread(threading.Thread):
                         draw_frame = cv2.cvtColor(dilate, cv2.COLOR_GRAY2RGB)
                     elif self.displayThreshold == 3:
                         hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
-                        white = np.where(hsv[:, :, 1] < 50, hsv[:, :, 2], np.zeros_like(hsv[:, :, 2]))
-                        white = np.where(hsv[:, :, 0] < 40, white, np.zeros_like(white))
+                        white = np.where(hsv[:, :, 1] < self.sat_thresh, hsv[:, :, 2], np.zeros_like(hsv[:, :, 2]))
+                        white = np.where(hsv[:, :, 0] < self.bright_thresh, white, np.zeros_like(white))
                         draw_frame = cv2.cvtColor(white, cv2.COLOR_GRAY2RGB)
                     else:
                         draw_frame = frame
@@ -821,7 +531,7 @@ class AnalyizeThread(threading.Thread):
                                     cv2.putText(draw_frame,
                                                 "R %.02f E %d" % (
                                                 cv2.contourArea(approx) / cv2.contourArea(c), len(approx)),
-                                                (approxRect[0], approxRect[1] + approxRect[3]),
+                                                (int(approxRect[0] + approxRect[2] / 2), approxRect[1] + int(approxRect[3]/2)),
                                                 fontFace=cv2.FONT_HERSHEY_COMPLEX_SMALL,
                                                 fontScale=1, color=(160, 255, 0), thickness=2)
 
@@ -930,6 +640,11 @@ class AnalyizeThread(threading.Thread):
                             continue
 
                         if label != lastIdentify or index == len(self.detections_adjusted) - 1:
+                            if index == len(self.detections_adjusted) - 1:
+                                lastIdentify = label
+                                identifyConfidence.append(float(confidence))
+                                identifyObjects.append(bbox)
+
                             if lastIdentify is not None:
                                 draw_detections = draw_detections + self.nms_detections(lastIdentify,
                                                                                         identifyConfidence,

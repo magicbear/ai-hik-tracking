@@ -6,7 +6,6 @@ CUDA_VERSION = torch.__version__.split("+")[-1]
 print("torch: ", TORCH_VERSION, "; cuda: ", CUDA_VERSION)
 
 import detectron2
-import cv2
 import time
 from detectron2.utils.logger import setup_logger
 setup_logger()
@@ -62,6 +61,8 @@ class AnalyizeThread(threading.Thread):
         cfg.MODEL.WEIGHTS = model_zoo.get_checkpoint_url("COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml")
         predictor = DefaultPredictor(cfg)
 
+        print("Start Tracking")
+
         while not terminated.get():
             if self.frame is not None:
                 self.mutex.acquire()
@@ -88,7 +89,7 @@ class AnalyizeThread(threading.Thread):
                     out = v.draw_instance_predictions(outputs["instances"][outputs["instances"].pred_classes == 0].to("cpu"))
                     # out = v.draw_instance_predictions(outputs["instances"].to("cpu"))
                     self.gui.mutex.acquire()
-                    self.gui.frame = out.get_image()[:, :, ::-1]
+                    self.gui.frame = cv2.cvtColor(out.get_image()[:, :, ::-1], cv2.COLOR_BGR2RGB)
                     self.gui.mutex.release()
                     for x in range(0,len(pred_classes)):
                         if pred_class_names[x] == "person":
@@ -109,8 +110,16 @@ class AnalyizeThread(threading.Thread):
                         self.artnet.pos = poslist if len(poslist) > 0 else None
                     self.artnet.mutex.release()
                 else:
+                    if self.artnet.test_mode:
+                        cv2.putText(frame, 'Test Mode',
+                                (20, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                1,
+                                (255, 0, 0),
+                                1,
+                                2)
                     self.gui.mutex.acquire()
-                    self.gui.frame = frame
+                    self.gui.frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     self.gui.mutex.release()
 
             time.sleep(0.01)
@@ -122,10 +131,11 @@ analyizeThread.start()
 lastCheck = 0
 
 try:
-    opts, _ = getopt.getopt(sys.argv[1:], "u:p:H:", ["user=", "passwd=", "ip="])
+    opts, _ = getopt.getopt(sys.argv[1:], "u:p:H:c:", ["user=", "passwd=", "ip=", "channel="])
     ip = None
     user = None
     passwd = None
+    channel = 1
     for opt, arg in opts:
         if opt in ["-u", "--user"]:
             user = arg
@@ -133,27 +143,29 @@ try:
             passwd = arg
         if opt in ["-H", "--ip"]:
             ip = arg
+        if opt in ["-c", "--channel"]:
+            channel = int(arg)
 except getopt.GetoptError:
     show_help()
     sys.exit(2)
 
 # cap = cv2.VideoCapture("rtsp://%s:%s@%s/Streaming/channels/101" % (user, passwd, ip))
 # cap = cv2.VideoCapture("rtsp://%s:%s@%s/Streaming/channels/302" % (user, passwd, ip))
-# cap = cv2.VideoCapture("rtsp://%s:%s@%s/Streaming/tracks/301?starttime=20220310T152930z" % (user, passwd, ip))
-# cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-#
-# while not terminated:
-#     # Capture frame-by-frame
-#     ret, frame = cap.read()
-#
-#     if time.time() - lastCheck >= 0.05:
-#         lastCheck = time.time()
-#         analyizeThread.mutex.acquire()
-#         analyizeThread.frame = frame
-#         analyizeThread.mutex.release()
+cap = cv2.VideoCapture("rtsp://%s:%s@%s/Streaming/tracks/301?starttime=20220310T152930z" % (user, passwd, ip))
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+while not terminated.get():
+    # Capture frame-by-frame
+    ret, frame = cap.read()
+
+    if time.time() - lastCheck >= 0.05:
+        lastCheck = time.time()
+        analyizeThread.mutex.acquire()
+        analyizeThread.frame = frame
+        analyizeThread.mutex.release()
 
 cam = hikevent.hikevent(ip, user, passwd)
-cam.startRealPlay(1, 0)
+cam.startRealPlay(channel, 0)
 
 analyizeThread = AnalyizeThread()
 analyizeThread.start()
