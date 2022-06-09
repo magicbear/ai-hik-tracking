@@ -8,15 +8,15 @@ import ctypes
 import datetime, time
 
 # Detectron2 Must be Import before darknet
-# from detectron2.utils.logger import setup_logger
-# setup_logger()
-#
-# from detectron2 import model_zoo
-# from detectron2.engine import DefaultPredictor
-# from detectron2.config import get_cfg
-# from detectron2.utils.visualizer import Visualizer
-# from detectron2.data import MetadataCatalog, DatasetCatalog
-# from detectron2.modeling import build_model
+from detectron2.utils.logger import setup_logger
+setup_logger()
+
+from detectron2 import model_zoo
+from detectron2.engine import DefaultPredictor
+from detectron2.config import get_cfg
+from detectron2.utils.visualizer import Visualizer
+from detectron2.data import MetadataCatalog, DatasetCatalog
+from detectron2.modeling import build_model
 # Detectron2 Must be Import before darknet
 
 import darknet
@@ -200,8 +200,8 @@ class GUIThread(threading.Thread):
         self.terminated_state = ts
         self.artnet = artnet
         self.cal_mtx = []
-        self.window_width = 1280
-        self.window_height = 720
+        self.window_width = 1920
+        self.window_height = 1080
         cal_params = json.load(open("cam_cal.json", "r"))
         self.objpoints = cal_params['objpoints']
         self.imgpoints = cal_params['imgpoints']
@@ -209,7 +209,7 @@ class GUIThread(threading.Thread):
         self.cal()
 
     def cal(self):
-        if self.artnet.ptz_preset >= len(self.objpoints) or len(self.objpoints[self.artnet.ptz_preset]) == 0:
+        if self.artnet is None or self.artnet.ptz_preset >= len(self.objpoints) or len(self.objpoints[self.artnet.ptz_preset]) == 0:
             return
         # 标定、去畸变
         # 输入：世界坐标系里的位置 像素坐标 图像的像素尺寸大小 3*3矩阵，相机内参数矩阵 畸变矩阵
@@ -324,7 +324,7 @@ class GUIThread(threading.Thread):
                 lp_pixel = ctypes.c_void_p()
                 pitch = ctypes.c_int()
 
-                if self.artnet.cal_mode:
+                if self.artnet is not None and self.artnet.cal_mode:
                     if move_x is not None:
                         x = x + (5 if move_x else -5)
                     if move_y is not None:
@@ -398,22 +398,21 @@ class GUIThread(threading.Thread):
                     if event.type == sdl2.SDL_KEYUP:
                         # elif event.key.keysym.sym == sdl2.SDLK_v:
                         #     monitor_output.value = 1 + monitor_output.value % (4 + len(cfg["sources"]))
-                        if event.key.keysym.sym == sdl2.SDLK_ESCAPE:
+                        if self.artnet is not None and event.key.keysym.sym == sdl2.SDLK_ESCAPE:
                             self.artnet.cal_mode = not self.artnet.cal_mode
                             if not self.artnet.cal_mode:
                                 json.dump({"window_width": self.window_width, "window_height": self.window_height, "objpoints": self.objpoints, 'imgpoints': self.imgpoints},
                                           open("cam_cal.json", "w"))
                                 self.cal()
-
                         elif event.key.keysym.sym == sdl2.SDLK_LCTRL or event.key.keysym.sym == sdl2.SDLK_RCTRL:
                             in_ctrl = False
-                        elif event.key.keysym.sym >= sdl2.SDLK_1 and event.key.keysym.sym <= sdl2.SDLK_9 and event.key.keysym.mod & (sdl2.KMOD_SHIFT):
+                        elif self.artnet is not None and event.key.keysym.sym >= sdl2.SDLK_1 and event.key.keysym.sym <= sdl2.SDLK_9 and event.key.keysym.mod & (sdl2.KMOD_SHIFT):
                             self.artnet.ptz_preset = event.key.keysym.sym - 48
                             if self.artnet.pelco_ip is not None:
                                 print("Set Preset ", self.artnet.ptz_preset)
                                 self.artnet.pelco_fd.send(self.artnet.build_pelco(0x03, 0x00, int(self.artnet.ptz_preset)))
                             self.cal()
-                        elif event.key.keysym.sym >= sdl2.SDLK_1 and event.key.keysym.sym <= sdl2.SDLK_9:
+                        elif self.artnet is not None and event.key.keysym.sym >= sdl2.SDLK_1 and event.key.keysym.sym <= sdl2.SDLK_9:
                             self.artnet.ptz_preset = event.key.keysym.sym - 48
                             print("Call Preset ", self.artnet.ptz_preset)
                             if self.artnet.pelco_ip is not None:
@@ -423,19 +422,19 @@ class GUIThread(threading.Thread):
                             move_y = None
                         elif event.key.keysym.sym == sdl2.SDLK_LEFT or event.key.keysym.sym == sdl2.SDLK_RIGHT:
                             move_x = None
-                        elif event.key.keysym.sym == sdl2.SDLK_i or event.key.keysym.sym == sdl2.SDLK_k:
+                        elif self.artnet is not None and event.key.keysym.sym == sdl2.SDLK_i or event.key.keysym.sym == sdl2.SDLK_k:
                             move_ptz_y = None
                             if self.artnet.pelco_ip is not None:
                                 self.artnet.pelco_fd.send(self.artnet.build_pelco(0, 0, 0))
-                        elif event.key.keysym.sym == sdl2.SDLK_j or event.key.keysym.sym == sdl2.SDLK_l:
+                        elif self.artnet is not None and event.key.keysym.sym == sdl2.SDLK_j or event.key.keysym.sym == sdl2.SDLK_l:
                             move_ptz_x = None
                             if self.artnet.pelco_ip is not None:
                                 self.artnet.pelco_fd.send(self.artnet.build_pelco(0, 0, 0))
-                        elif event.key.keysym.sym == sdl2.SDLK_z and event.key.keysym.mod & sdl2.KMOD_CTRL:
+                        elif self.artnet is not None and event.key.keysym.sym == sdl2.SDLK_z and event.key.keysym.mod & sdl2.KMOD_CTRL:
                             if len(self.objpoints) >= self.artnet.ptz_preset and len(self.objpoints[self.artnet.ptz_preset])>0:
                                 self.objpoints[self.artnet.ptz_preset].pop()
                                 self.imgpoints[self.artnet.ptz_preset].pop()
-                        elif event.key.keysym.sym == sdl2.SDLK_r:
+                        elif self.artnet is not None and event.key.keysym.sym == sdl2.SDLK_r:
                             if len(self.objpoints) >= self.artnet.ptz_preset:
                                 self.objpoints[self.artnet.ptz_preset] = []
                                 self.imgpoints[self.artnet.ptz_preset] = []
@@ -477,6 +476,8 @@ class GUIThread(threading.Thread):
                         elif event.key.keysym.sym == sdl2.SDLK_MINUS:
                             zoom_in = False
                     elif event.type == sdl2.SDL_MOUSEBUTTONUP:
+                        if self.artnet is None:
+                            break
                         if self.artnet.cal_mode:
                             if self.artnet.ptz_preset not in self.objpoints:
                                 while len(self.objpoints) <= self.artnet.ptz_preset:
