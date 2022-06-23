@@ -63,7 +63,7 @@ class AnalyizeThread(threading.Thread):
         self.detections_adjusted = []  # Offset: Center X, Center Y,
         self.available_cards = []
         self.useCudaProcess = cvCudaProcess
-        self.backend = "opencv"
+        self.backend = "darknet"
         self.default_pref = cv2.dnn.DNN_TARGET_CUDA_FP16
         self.load_dnn_networks()
         self.sat_thresh = 60
@@ -80,7 +80,7 @@ class AnalyizeThread(threading.Thread):
         self.xPID.output_limits = (-7, 7)
         self.yPID = PID(15, 1, 0.2, setpoint=0)
         self.yPID.output_limits = (-7, 7)
-        self.zoomPID = PID(5, 0.1, 0.2, setpoint=0.5)
+        self.zoomPID = PID(3, 0.1, 0.2, setpoint=0.5)
         self.zoomPID.output_limits = (-7, 7)
         self.ptzOperating = [False, False, False, False, False, False]
         self.fullDuplexZoom = False
@@ -91,8 +91,8 @@ class AnalyizeThread(threading.Thread):
         global cfg_file, weightFile
 
         config_set = [
-            ['darknet/cfg/yolov4.cfg', 'pre-trained/yolov4.weights'],
             ['darknet/cfg/yolov4-tiny.cfg', 'pre-trained/yolov4-tiny.weights'],
+            ['darknet/cfg/yolov4.cfg', 'pre-trained/yolov4.weights'],
             ['darknet/cfg/yolov4-csp.cfg', 'pre-trained/yolov4-csp.weights'],
             ['darknet/cfg/yolov4-csp-swish.cfg', 'pre-trained/yolov4-csp-swish.weights'],
         ]
@@ -508,7 +508,7 @@ class AnalyizeThread(threading.Thread):
                     self.lastFrame = frame
 
                     analyizeDebugColor = (255, 0, 0)
-                    if lastDetect is None and now - lastAnalyize < 0.5 and self.displayThreshold == 0:
+                    if lastDetect is None and now - lastAnalyize < 0.1 and self.displayThreshold == 0:
                         analyizeDebugColor = (0, 255, 0)
                     else:
                         if self.useCudaProcess:
@@ -557,7 +557,7 @@ class AnalyizeThread(threading.Thread):
                                                                  cv2.THRESH_BINARY + cv2.THRESH_OTSU)
                         else:
                             if frame.shape[1] != frame_width or frame.shape[0] != frame_height:
-                                frame = cv2.resize(self.frame, (frame_width, frame_height))
+                                frame = cv2.resize(frame, (frame_width, frame_height))
                             frame = cv2.convertScaleAbs(frame, alpha=self.alpha, beta=self.beta)
                             hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
                             retval, sat_bin = cv2.threshold(hsv[:, :, 1], self.sat_thresh, 1,
@@ -764,208 +764,220 @@ class AnalyizeThread(threading.Thread):
                             # print("%3d / %3d" % (self.detection_done, detection_queue), end="\r")
                             time.sleep(0.001)
 
-                    self.detections_adjusted.sort(key=lambda x: x[0])
-                    lastIdentify = None
-                    identifyObjects = []
-                    identifyConfidence = []
-                    draw_detections = []
+                        self.detections_adjusted.sort(key=lambda x: x[0])
+                        lastIdentify = None
+                        identifyObjects = []
+                        identifyConfidence = []
+                        draw_detections = []
 
-                    for index in range(len(self.detections_adjusted)):
-                        (label, confidence, bbox) = self.detections_adjusted[index]
-                        (cx, cy, cw, ch) = bbox
-                        if cw == 0 or ch == 0:
+                        for index in range(len(self.detections_adjusted)):
+                            (label, confidence, bbox) = self.detections_adjusted[index]
+                            (cx, cy, cw, ch) = bbox
+                            if cw == 0 or ch == 0:
+                                continue
+
+                            if label != lastIdentify or index == len(self.detections_adjusted) - 1:
+                                if index == len(self.detections_adjusted) - 1:
+                                    lastIdentify = label
+                                    identifyConfidence.append(float(confidence))
+                                    identifyObjects.append(bbox)
+
+                                if lastIdentify is not None:
+                                    draw_detections = draw_detections + self.nms_detections(lastIdentify,
+                                                                                            identifyConfidence,
+                                                                                            identifyObjects)
+                                    identifyObjects = []
+                                    identifyConfidence = []
+
+                                lastIdentify = label
+                            identifyConfidence.append(float(confidence))
+                            identifyObjects.append(bbox)
+
+                        self.detectResult = draw_detections
+
+                        if final_contours is not None:
+                            contours = final_contours
+                        else:
+                            contours, hierarchy = cv2.findContours(thresh_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+                        for c in contours:
+                            if cv2.contourArea(c) >= minCardAreaRatio * draw_frame.shape[0] * draw_frame.shape[1]:
+                                peri = cv2.arcLength(c, True)
+                                approx = cv2.approxPolyDP(c, self.approx_thresh * peri, True)
+                                if final_contours is not None or len(approx) <= maxAllowShape:
+                                    approxRect = cv2.boundingRect(approx)
+                                    if final_contours is None:
+                                        if approxRect[2] < minCardSizeRatio * draw_frame.shape[1] or approxRect[3] < minCardSizeRatio * draw_frame.shape[0]:
+                                            continue
+
+                                        if approxRect[2] / approxRect[3] > maxCardSizeRatio or approxRect[3] / approxRect[2] > maxCardSizeRatio:
+                                            continue
+
+                                    cv2.drawContours(draw_frame, [approx], -1, (255, 0, 0),
+                                                         1)  # ---set the last parameter to -1
+
+                        if self.detection_done == 0xff:
                             continue
 
-                        if label != lastIdentify or index == len(self.detections_adjusted) - 1:
-                            if index == len(self.detections_adjusted) - 1:
-                                lastIdentify = label
-                                identifyConfidence.append(float(confidence))
-                                identifyObjects.append(bbox)
+                        if time.time() - moveDutyReset >= 60:
+                            moveDutyReset = time.time()
+                            moveDutyCycle = 0
 
-                            if lastIdentify is not None:
-                                draw_detections = draw_detections + self.nms_detections(lastIdentify,
-                                                                                        identifyConfidence,
-                                                                                        identifyObjects)
-                                identifyObjects = []
-                                identifyConfidence = []
+                        if len(draw_detections) > 0:
+                            persons_bbox = np.array([[bbox[0] - bbox[2] / 2, bbox[1] - bbox[3] / 2, bbox[0] + bbox[2] / 2, bbox[1] + bbox[3] / 2] for labels, cofidence, bbox in draw_detections])
+                            w = np.max(persons_bbox[:, 2]) - np.min(persons_bbox[:, 0])
+                            h = np.max(persons_bbox[:, 3]) - np.min(persons_bbox[:, 1])
+                            cx = int(np.min(persons_bbox[:, 0]) + w / 2)
+                            cy = int(np.min(persons_bbox[:, 1]) + h / 2)
 
-                            lastIdentify = label
-                        identifyConfidence.append(float(confidence))
-                        identifyObjects.append(bbox)
+                            cv2.line(draw_frame, (cx - 10, cy), (cx + 10, cy), (255, 0, 0), 5)
+                            cv2.line(draw_frame, (cx, cy - 10), (cx, cy + 10), (255, 0, 0), 5)
+                            x_error = cx / draw_frame.shape[1] - 0.5
+                            y_error = cy / draw_frame.shape[0] - 0.5
+                            z_error = max(w / draw_frame.shape[1], h / draw_frame.shape[0])
+                            # print(np.min(persons_bbox[:, 0]), np.min(persons_bbox[:, 1]), np.max(persons_bbox[:, 2]), np.max(persons_bbox[:, 3]))
 
-                    self.detectResult = draw_detections
+                            if moveDutyCycle < 20:
+                                self.xPID.set_auto_mode(True)
+                                self.yPID.set_auto_mode(True)
+                                self.zoomPID.set_auto_mode(True)
 
-                    if final_contours is not None:
-                        contours = final_contours
-                    else:
-                        contours, hierarchy = cv2.findContours(thresh_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                                ctrl_x = self.xPID(x_error)
+                                ctrl_y = self.yPID(y_error)
+                                ctrl_z = self.zoomPID(z_error)
+                                if ctrl_x >= 7:
+                                    ctrl_x = 7
+                                elif ctrl_x <= -7:
+                                    ctrl_x = -7
+                                if ctrl_y >= 7:
+                                    ctrl_y = 7
+                                elif ctrl_y <= -7:
+                                    ctrl_y = -7
 
-                    for c in contours:
-                        if cv2.contourArea(c) >= minCardAreaRatio * draw_frame.shape[0] * draw_frame.shape[1]:
-                            peri = cv2.arcLength(c, True)
-                            approx = cv2.approxPolyDP(c, self.approx_thresh * peri, True)
-                            if final_contours is not None or len(approx) <= maxAllowShape:
-                                approxRect = cv2.boundingRect(approx)
-                                if final_contours is None:
-                                    if approxRect[2] < minCardSizeRatio * draw_frame.shape[1] or approxRect[3] < minCardSizeRatio * draw_frame.shape[0]:
-                                        continue
+                                self.ptzSpeed = int(min(abs(ctrl_x), abs(ctrl_y)) + abs(abs(ctrl_x)-abs(ctrl_y)) / 2)
+                                if self.ptzSpeed == 0:
+                                    self.ptzSpeed = 1
+                                self.moveDirFlags[2] = ctrl_y <= -self.ptzSpeed / 2
+                                self.moveDirFlags[0] = ctrl_y >= self.ptzSpeed / 2
+                                self.moveDirFlags[1] = ctrl_x <= -self.ptzSpeed / 2
+                                self.moveDirFlags[3] = ctrl_x >= self.ptzSpeed / 2
+                                self.moveDirFlags[4] = ctrl_z >= self.ptzSpeed / 2
+                                self.moveDirFlags[5] = ctrl_z <= -self.ptzSpeed / 2
 
-                                    if approxRect[2] / approxRect[3] > maxCardSizeRatio or approxRect[3] / approxRect[2] > maxCardSizeRatio:
-                                        continue
+                                if not self.fullDuplexZoom and (self.moveDirFlags[4] or self.moveDirFlags[5]) and ((ctrl_z >= self.ptzSpeed and ctrl_z >= 3) or -ctrl_z >= self.ptzSpeed):
+                                    print("Force Execute Zoom")
+                                    self.moveDirFlags[0] = False
+                                    self.moveDirFlags[1] = False
+                                    self.moveDirFlags[2] = False
+                                    self.moveDirFlags[3] = False
+                                    self.ptzSpeed = int(abs(ctrl_z))
+                                elif not self.fullDuplexZoom:
+                                    self.moveDirFlags[4] = False
+                                    self.moveDirFlags[5] = False
 
-                                cv2.drawContours(draw_frame, [approx], -1, (255, 0, 0),
-                                                     1)  # ---set the last parameter to -1
+                                if functools.reduce(lambda a,b: a|b, self.moveDirFlags) and time.time() - moveDutyCheck >= 1:
+                                    moveDutyCheck = time.time()
+                                    moveDutyCycle += 1
 
-                    if self.detection_done == 0xff:
-                        continue
-
-                    if time.time() - moveDutyReset >= 60:
-                        moveDutyReset = time.time()
-                        moveDutyCycle = 0
-
-                    if len(draw_detections) > 0:
-                        persons_bbox = np.array([[bbox[0] - bbox[2] / 2, bbox[1] - bbox[3] / 2, bbox[0] + bbox[2] / 2, bbox[1] + bbox[3] / 2] for labels, cofidence, bbox in draw_detections])
-                        w = np.max(persons_bbox[:, 2]) - np.min(persons_bbox[:, 0])
-                        h = np.max(persons_bbox[:, 3]) - np.min(persons_bbox[:, 1])
-                        cx = int(np.min(persons_bbox[:, 0]) + w / 2)
-                        cy = int(np.min(persons_bbox[:, 1]) + h / 2)
-
-                        cv2.line(draw_frame, (cx - 10, cy), (cx + 10, cy), (255, 0, 0), 5)
-                        cv2.line(draw_frame, (cx, cy - 10), (cx, cy + 10), (255, 0, 0), 5)
-                        x_error = cx / draw_frame.shape[1] - 0.5
-                        y_error = cy / draw_frame.shape[0] - 0.5
-                        z_error = max(w / draw_frame.shape[1], h / draw_frame.shape[0])
-                        # print(np.min(persons_bbox[:, 0]), np.min(persons_bbox[:, 1]), np.max(persons_bbox[:, 2]), np.max(persons_bbox[:, 3]))
-
-                        if moveDutyCycle < 20:
-                            self.xPID.set_auto_mode(True)
-                            self.yPID.set_auto_mode(True)
-                            self.zoomPID.set_auto_mode(True)
-
-                            ctrl_x = self.xPID(x_error)
-                            ctrl_y = self.yPID(y_error)
-                            ctrl_z = self.zoomPID(z_error)
-                            if ctrl_x >= 7:
-                                ctrl_x = 7
-                            elif ctrl_x <= -7:
-                                ctrl_x = -7
-                            if ctrl_y >= 7:
-                                ctrl_y = 7
-                            elif ctrl_y <= -7:
-                                ctrl_y = -7
-
-                            self.ptzSpeed = int(min(abs(ctrl_x), abs(ctrl_y)) + abs(abs(ctrl_x)-abs(ctrl_y)) / 2)
-                            if self.ptzSpeed == 0:
-                                self.ptzSpeed = 1
-                            self.moveDirFlags[2] = ctrl_y <= -self.ptzSpeed / 2
-                            self.moveDirFlags[0] = ctrl_y >= self.ptzSpeed / 2
-                            self.moveDirFlags[1] = ctrl_x <= -self.ptzSpeed / 2
-                            self.moveDirFlags[3] = ctrl_x >= self.ptzSpeed / 2
-                            self.moveDirFlags[4] = ctrl_z >= self.ptzSpeed / 2
-                            self.moveDirFlags[5] = ctrl_z <= -self.ptzSpeed / 2
-
-                            if not self.fullDuplexZoom and (self.moveDirFlags[4] or self.moveDirFlags[5]) and abs(ctrl_z) >= self.ptzSpeed:
-                                print("Force Execute Zoom")
-                                self.moveDirFlags[0] = False
-                                self.moveDirFlags[1] = False
-                                self.moveDirFlags[2] = False
-                                self.moveDirFlags[3] = False
-                                self.ptzSpeed = int(abs(ctrl_z))
-                            elif not self.fullDuplexZoom:
-                                self.moveDirFlags[4] = False
-                                self.moveDirFlags[5] = False
-
-                            if functools.reduce(lambda a,b: a|b, self.moveDirFlags) and time.time() - moveDutyCheck >= 1:
-                                moveDutyCheck = time.time()
-                                moveDutyCycle += 1
-
-                            try:
-                                print("%s -> X %.02f Err %.03f / Y %.02f Err %.03f / Z %.02f Err %.03f / Speed %d                 "  % (datetime.datetime.now(), ctrl_x,x_error,  ctrl_y, y_error, ctrl_z, z_error, self.ptzSpeed), end="\r")
-                                self.updatePTZCommand()
-                            except Exception as e:
-                                if e == "NET_DVR_PTZControlWithSpeed_Other error, 23: Device does not support this function.":
-                                    self.fullDuplexZoom = False
-                                print(e)
-                                pass
-                        else:
-                            if functools.reduce(lambda a,b: a|b, self.moveDirFlags):
-                                self.moveDirFlags[0] = False
-                                self.moveDirFlags[2] = False
-                                self.moveDirFlags[1] = False
-                                self.moveDirFlags[3] = False
-                                self.moveDirFlags[4] = False
-                                self.moveDirFlags[5] = False
                                 try:
+                                    print("%s -> X %.02f Err %.03f / Y %.02f Err %.03f / Z %.02f Err %.03f / Speed %d                 "  % (datetime.datetime.now(), ctrl_x,x_error,  ctrl_y, y_error, ctrl_z, z_error, self.ptzSpeed), end="\r")
                                     self.updatePTZCommand()
                                 except Exception as e:
+                                    if e == "NET_DVR_PTZControlWithSpeed_Other error, 23: Device does not support this function.":
+                                        self.fullDuplexZoom = False
                                     print(e)
                                     pass
-                            print("%s X %.02f Err %.03f / Y %.02f Err %.03f / Z %.02f Err %.03f / Speed %d Ignored         " % (
-                                datetime.datetime.now(), ctrl_x, x_error, ctrl_y, y_error, ctrl_z, z_error,
-                                self.ptzSpeed), end="\r")
+                            else:
+                                if functools.reduce(lambda a,b: a|b, self.moveDirFlags):
+                                    self.moveDirFlags[0] = False
+                                    self.moveDirFlags[2] = False
+                                    self.moveDirFlags[1] = False
+                                    self.moveDirFlags[3] = False
+                                    self.moveDirFlags[4] = False
+                                    self.moveDirFlags[5] = False
+                                    try:
+                                        self.updatePTZCommand()
+                                    except Exception as e:
+                                        print(e)
+                                        pass
 
-                        lastDetect = time.time()
-                    elif lastDetect is not None and time.time() - lastDetect >= 5:
-                        lastDetect = None
-                        self.xPID.reset()
-                        self.yPID.reset()
-                        self.zoomPID.reset()
-                        try:
-                            self.cam.ptzPreset(self.channel, 1)
-                        except Exception as e:
-                            print(e)
-                            pass
-                    elif lastDetect is not None and time.time() - lastDetect >= 1 and time.time() - lastDetect < 2:
-                        self.moveDirFlags[0] = False
-                        self.moveDirFlags[2] = False
-                        self.moveDirFlags[1] = False
-                        self.moveDirFlags[3] = False
-                        self.moveDirFlags[4] = False
-                        self.moveDirFlags[5] = False
-                        try:
-                            self.updatePTZCommand()
-                        except Exception as e:
-                            print(e)
-                            pass
-                        if self.ptzOperating[4]:
-                            self.cam.ptzControl(self.channel, 11, True)
-                        elif self.ptzOperating[5]:
-                            self.cam.ptzControl(self.channel, 12, True)
-                        self.xPID.set_auto_mode(False)
-                        self.yPID.set_auto_mode(False)
+                                if lastDetect is not None and time.time() - lastDetect >= 5:
+                                    lastDetect = None
+                                    self.xPID.reset()
+                                    self.yPID.reset()
+                                    self.zoomPID.reset()
+                                    try:
+                                        self.cam.ptzPreset(self.channel, 1)
+                                    except Exception as e:
+                                        print(e)
+                                        pass
+                                
+                                print("%s X %.02f Err %.03f / Y %.02f Err %.03f / Z %.02f Err %.03f / Speed %d Ignored         " % (
+                                    datetime.datetime.now(), ctrl_x, x_error, ctrl_y, y_error, ctrl_z, z_error,
+                                    self.ptzSpeed), end="\r")
+
+                            lastDetect = time.time()
+                        elif lastDetect is not None and time.time() - lastDetect >= 5:
+                            lastDetect = None
+                            self.xPID.reset()
+                            self.yPID.reset()
+                            self.zoomPID.reset()
+                            try:
+                                self.cam.ptzPreset(self.channel, 1)
+                            except Exception as e:
+                                print(e)
+                                pass
+                        elif lastDetect is not None and time.time() - lastDetect >= 1 and time.time() - lastDetect < 2:
+                            self.moveDirFlags[0] = False
+                            self.moveDirFlags[2] = False
+                            self.moveDirFlags[1] = False
+                            self.moveDirFlags[3] = False
+                            self.moveDirFlags[4] = False
+                            self.moveDirFlags[5] = False
+                            try:
+                                self.updatePTZCommand()
+                            except Exception as e:
+                                print(e)
+                                pass
+                            if self.ptzOperating[4]:
+                                self.cam.ptzControl(self.channel, 11, True)
+                            elif self.ptzOperating[5]:
+                                self.cam.ptzControl(self.channel, 12, True)
+                            self.xPID.set_auto_mode(False)
+                            self.yPID.set_auto_mode(False)
 
 
-                    image = darknet.draw_boxes(draw_detections,
-                                               draw_frame,
-                                               self.threads[0].class_colors)
+                        image = darknet.draw_boxes(draw_detections,
+                                                   draw_frame,
+                                                   self.threads[0].class_colors)
 
-                    output_str = '%s FPS %d  T i %d / g %d / t %d ms  Seg %d  Detected: %d Weight: %s' % (
-                        self.backend, int(1 / (time.time() - prev_time)), int(ti * 1000),
-                        self.t_detect * 1000,
-                        (time.time() - prev_time) * 1000,
-                        self.detection_done,
-                        len(self.detectResult),
-                        weightFile.split('/')[-1]
-                    )
+                        output_str = '%s FPS %d  T i %d / g %d / t %d ms  Seg %d  Detected: %d Weight: %s' % (
+                            self.backend, int(1 / (time.time() - prev_time)), int(ti * 1000),
+                            self.t_detect * 1000,
+                            (time.time() - prev_time) * 1000,
+                            self.detection_done,
+                            len(self.detectResult),
+                            weightFile.split('/')[-1]
+                        )
 
-                    cv2.putText(image, output_str,
-                                (20, 40),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                1,
-                                (255, 255, 255),
-                                3,
-                                2)
-                    cv2.putText(image, output_str,
-                                (20, 40),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                1,
-                                analyizeDebugColor,
-                                1,
-                                2)
+                        cv2.putText(image, output_str,
+                                    (20, 40),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    1,
+                                    (255, 255, 255),
+                                    3,
+                                    2)
+                        cv2.putText(image, output_str,
+                                    (20, 40),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    1,
+                                    analyizeDebugColor,
+                                    1,
+                                    2)
 
-                    self.gui.mutex.acquire()
-                    self.gui.frame = image
-                    self.gui.mutex.release()
+                        self.gui.mutex.acquire()
+                        self.gui.frame = image
+                        self.gui.mutex.release()
                 else:
                     # self.moveDirFlags[0] = False
                     # self.moveDirFlags[2] = False

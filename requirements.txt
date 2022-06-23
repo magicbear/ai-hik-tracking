@@ -1,3 +1,7 @@
 pysdl2
 numpy
 stupidArtnet
+imutils
+labelme
+simple_pid
+paho-mqtt

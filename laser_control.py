@@ -200,8 +200,8 @@ class GUIThread(threading.Thread):
         self.terminated_state = ts
         self.artnet = artnet
         self.cal_mtx = []
-        self.window_width = 1920
-        self.window_height = 1080
+        self.window_width = 1280
+        self.window_height = 720
         cal_params = json.load(open("cam_cal.json", "r"))
         self.objpoints = cal_params['objpoints']
         self.imgpoints = cal_params['imgpoints']
